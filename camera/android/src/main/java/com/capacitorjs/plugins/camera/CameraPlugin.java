@@ -55,6 +55,8 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.json.JSONException;
+import android.util.Log;
+
 
 /**
  * The Camera plugin makes it easy to take a photo or have the user select a photo
@@ -89,6 +91,7 @@ public class CameraPlugin extends Plugin {
     // Permission alias constants
     static final String CAMERA = "camera";
     static final String PHOTOS = "photos";
+    static final String VIDEOS = "videos";
     static final String SAVE_GALLERY = "saveGallery";
     static final String READ_EXTERNAL_STORAGE = "readExternalStorage";
 
@@ -153,6 +156,9 @@ public class CameraPlugin extends Plugin {
                 showCamera(call);
                 break;
             case PHOTOS:
+                showPhotos(call);
+                break;
+            case VIDEOS:
                 showPhotos(call);
                 break;
             default:
@@ -356,6 +362,16 @@ public class CameraPlugin extends Plugin {
 
     private void openPhotos(final PluginCall call, boolean multiple) {
         try {
+            // Determine the media type based on CameraSource enum values
+            ActivityResultContracts.PickVisualMedia.VisualMediaType mediaType;
+            CameraSource source = settings.getSource();
+    
+            mediaType = switch (source) {
+                case PHOTOS -> ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE;
+                case VIDEOS -> ActivityResultContracts.PickVisualMedia.VideoOnly.INSTANCE;
+                default -> ActivityResultContracts.PickVisualMedia.ImageAndVideo.INSTANCE;
+            };
+    
             if (multiple) {
                 pickMultipleMedia =
                     registerActivityResultLauncher(
@@ -393,7 +409,7 @@ public class CameraPlugin extends Plugin {
                         }
                     );
                 pickMultipleMedia.launch(
-                    new PickVisualMediaRequest.Builder().setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE).build()
+                    new PickVisualMediaRequest.Builder().setMediaType(mediaType).build()
                 );
             } else {
                 pickMedia =
@@ -410,7 +426,7 @@ public class CameraPlugin extends Plugin {
                         }
                     );
                 pickMedia.launch(
-                    new PickVisualMediaRequest.Builder().setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE).build()
+                    new PickVisualMediaRequest.Builder().setMediaType(mediaType).build()
                 );
             }
         } catch (ActivityNotFoundException ex) {
@@ -436,7 +452,7 @@ public class CameraPlugin extends Plugin {
             return;
         }
 
-        returnResult(call, bitmap, contentUri);
+        returnResult(call, bitmap, contentUri, false);
     }
 
     public void processPickedImage(PluginCall call, ActivityResult result) {
@@ -462,36 +478,60 @@ public class CameraPlugin extends Plugin {
     private void processPickedImage(Uri imageUri, PluginCall call) {
         InputStream imageStream = null;
 
-        try {
-            imageStream = getContext().getContentResolver().openInputStream(imageUri);
-            Bitmap bitmap = BitmapFactory.decodeStream(imageStream);
+        // Check if imageUri is a video by querying its MIME type
+        String mimeType = getContext().getContentResolver().getType(imageUri);
+        boolean isVideo = mimeType != null && mimeType.startsWith("video");
 
-            if (bitmap == null) {
-                call.reject("Unable to process bitmap");
-                return;
+        if (isVideo) {
+            Log.d("[TRANS]", "[TRANS] processPickedImage: isVideo");
+            try {
+                Bitmap bitmap = MediaStore.Video.Thumbnails.getThumbnail(
+                    getContext().getContentResolver(),
+                    Long.parseLong(imageUri.getLastPathSegment()),
+                    MediaStore.Video.Thumbnails.MINI_KIND,
+                    null
+                );
+                if (bitmap == null) {
+                    call.reject("Unable to process video bitmap");
+                    return;
+                }
+                returnResult(call, bitmap, imageUri, true);
+            } catch (Exception ex) {
+                call.reject("Unable to process video bitmap", ex);
             }
+        } else {
+            Log.d("[TRANS]", "[TRANS] processPickedImage: isImage");
+            try {
+                imageStream = getContext().getContentResolver().openInputStream(imageUri);
+                Bitmap bitmap = BitmapFactory.decodeStream(imageStream);
 
-            returnResult(call, bitmap, imageUri);
-        } catch (OutOfMemoryError err) {
-            call.reject("Out of memory");
-        } catch (FileNotFoundException ex) {
-            call.reject("No such image found", ex);
-        } finally {
-            if (imageStream != null) {
-                try {
-                    imageStream.close();
-                } catch (IOException e) {
-                    Logger.error(getLogTag(), UNABLE_TO_PROCESS_IMAGE, e);
+                if (bitmap == null) {
+                    call.reject("Unable to process bitmap");
+                    return;
+                }
+
+                returnResult(call, bitmap, imageUri, false);
+            } catch (OutOfMemoryError err) {
+                call.reject("Out of memory");
+            } catch (FileNotFoundException ex) {
+                call.reject("No such image found", ex);
+            } finally {
+                if (imageStream != null) {
+                    try {
+                        imageStream.close();
+                    } catch (IOException e) {
+                        Logger.error(getLogTag(), UNABLE_TO_PROCESS_IMAGE, e);
+                    }
                 }
             }
         }
     }
 
-    private JSObject processPickedImages(Uri imageUri) {
+    private JSObject processPickedImages(Uri uri) {
         InputStream imageStream = null;
         JSObject ret = new JSObject();
         try {
-            imageStream = getContext().getContentResolver().openInputStream(imageUri);
+            imageStream = getContext().getContentResolver().openInputStream(uri);
             Bitmap bitmap = BitmapFactory.decodeStream(imageStream);
 
             if (bitmap == null) {
@@ -499,18 +539,18 @@ public class CameraPlugin extends Plugin {
                 return ret;
             }
 
-            ExifWrapper exif = ImageUtils.getExifData(getContext(), bitmap, imageUri);
+            ExifWrapper exif = ImageUtils.getExifData(getContext(), bitmap, uri);
             try {
-                bitmap = prepareBitmap(bitmap, imageUri, exif);
+                bitmap = prepareBitmap(bitmap, uri, exif);
             } catch (IOException e) {
                 ret.put("error", UNABLE_TO_PROCESS_IMAGE);
                 return ret;
             }
             // Compress the final image and prepare for output to client
-            ByteArrayOutputStream bitmapOutputStream = new ByteArrayOutputStream();
-            bitmap.compress(Bitmap.CompressFormat.JPEG, settings.getQuality(), bitmapOutputStream);
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.JPEG, settings.getQuality(), outputStream);
 
-            Uri newUri = getTempImage(imageUri, bitmapOutputStream);
+            Uri newUri = getTempMedia(uri, outputStream);
             exif.copyExif(newUri.getPath());
             if (newUri != null) {
                 ret.put("format", "jpeg");
@@ -591,12 +631,34 @@ public class CameraPlugin extends Plugin {
     }
 
     private File getTempFile(Uri uri) {
+        // Extract the filename from the URI
         String filename = Uri.parse(Uri.decode(uri.toString())).getLastPathSegment();
-        if (!filename.contains(".jpg") && !filename.contains(".jpeg")) {
-            filename += "." + (new java.util.Date()).getTime() + ".jpeg";
+        
+        // Get the file extension
+        String extension = getFileExtension(uri);
+
+        // Check if filename already has an extension
+        if (filename != null && !filename.contains(".")) {
+            filename = filename + "." + extension; // Add extension if missing
         }
+
+        // Return a temp file in the cache directory
         File cacheDir = getContext().getCacheDir();
         return new File(cacheDir, filename);
+    }
+
+    private String getFileExtension(Uri uri) {
+        String mimeType = getContext().getContentResolver().getType(uri);
+        String extension = null;
+        if (mimeType != null) {
+            // Split the MIME type by '/'
+            String[] mimeParts = mimeType.split("/");
+            if (mimeParts.length > 1) {
+                // Use the second part of the MIME type as the extension
+                extension = mimeParts[1];
+            }
+        }
+        return extension;
     }
 
     /**
@@ -606,25 +668,42 @@ public class CameraPlugin extends Plugin {
      * @param u
      */
     @SuppressWarnings("deprecation")
-    private void returnResult(PluginCall call, Bitmap bitmap, Uri u) {
+    private void returnResult(PluginCall call, Bitmap bitmap, Uri u, boolean isVideo) {
         ExifWrapper exif = ImageUtils.getExifData(getContext(), bitmap, u);
+        ByteArrayOutputStream outputStream;
+
         try {
-            bitmap = prepareBitmap(bitmap, u, exif);
+            if (isVideo) {
+                // For video output
+                outputStream = new ByteArrayOutputStream();
+                try (InputStream inputStream = getContext().getContentResolver().openInputStream(u)) {
+                    if (inputStream == null) {
+                        throw new IOException("Unable to open video input stream.");
+                    }
+                    byte[] buffer = new byte[1024];
+                    int len;
+                    while ((len = inputStream.read(buffer)) != -1) {
+                        outputStream.write(buffer, 0, len);
+                    }
+                }
+            } else {
+                // For image output
+                bitmap = prepareBitmap(bitmap, u, exif);
+                outputStream = new ByteArrayOutputStream();
+                bitmap.compress(Bitmap.CompressFormat.JPEG, settings.getQuality(), outputStream);
+            }
         } catch (IOException e) {
             call.reject(UNABLE_TO_PROCESS_IMAGE);
             return;
         }
-        // Compress the final image and prepare for output to client
-        ByteArrayOutputStream bitmapOutputStream = new ByteArrayOutputStream();
-        bitmap.compress(Bitmap.CompressFormat.JPEG, settings.getQuality(), bitmapOutputStream);
 
-        if (settings.isAllowEditing() && !isEdited) {
-            editImage(call, u, bitmapOutputStream);
+        if (settings.isAllowEditing() && !isEdited && !isVideo) {
+            editImage(call, u, outputStream);
             return;
         }
 
         boolean saveToGallery = call.getBoolean("saveToGallery", CameraSettings.DEFAULT_SAVE_IMAGE_TO_GALLERY);
-        if (saveToGallery && (imageEditedFileSavePath != null || imageFileSavePath != null)) {
+        if (!isVideo && saveToGallery && (imageEditedFileSavePath != null || imageFileSavePath != null)) {
             isSaved = true;
             try {
                 String fileToSavePath = imageEditedFileSavePath != null ? imageEditedFileSavePath : imageFileSavePath;
@@ -649,8 +728,7 @@ public class CameraPlugin extends Plugin {
                         throw new IOException("Failed to open output stream.");
                     }
 
-                    Boolean inserted = bitmap.compress(Bitmap.CompressFormat.JPEG, settings.getQuality(), stream);
-
+                    boolean inserted = bitmap.compress(Bitmap.CompressFormat.JPEG, settings.getQuality(), stream);
                     if (!inserted) {
                         isSaved = false;
                     }
@@ -676,15 +754,15 @@ public class CameraPlugin extends Plugin {
         }
 
         if (settings.getResultType() == CameraResultType.BASE64) {
-            returnBase64(call, exif, bitmapOutputStream);
+            returnBase64(call, exif, u, outputStream, isVideo);
         } else if (settings.getResultType() == CameraResultType.URI) {
-            returnFileURI(call, exif, bitmap, u, bitmapOutputStream);
+            returnFileURI(call, exif, u, outputStream, isVideo);
         } else if (settings.getResultType() == CameraResultType.DATAURL) {
-            returnDataUrl(call, exif, bitmapOutputStream);
+            returnDataUrl(call, exif, u, outputStream, isVideo);
         } else {
             call.reject(INVALID_RESULT_TYPE_ERROR);
         }
-        // Result returned, clear stored paths and images
+
         if (settings.getResultType() != CameraResultType.URI) {
             deleteImageFile();
         }
@@ -703,13 +781,16 @@ public class CameraPlugin extends Plugin {
         }
     }
 
-    private void returnFileURI(PluginCall call, ExifWrapper exif, Bitmap bitmap, Uri u, ByteArrayOutputStream bitmapOutputStream) {
-        Uri newUri = getTempImage(u, bitmapOutputStream);
+    private void returnFileURI(PluginCall call, ExifWrapper exif, Uri u, ByteArrayOutputStream outputStream, boolean isVideo) {
+        Uri newUri = getTempMedia(u, outputStream);
+        String extension = getFileExtension(newUri);
         exif.copyExif(newUri.getPath());
         if (newUri != null) {
             JSObject ret = new JSObject();
-            ret.put("format", "jpeg");
-            ret.put("exif", exif.toJson());
+            ret.put("format", extension);
+            if (!isVideo) {
+                ret.put("exif", exif.toJson());
+            }
             ret.put("path", newUri.toString());
             ret.put("webPath", FileUtils.getPortablePath(getContext(), bridge.getLocalUrl(), newUri));
             ret.put("saved", isSaved);
@@ -719,11 +800,11 @@ public class CameraPlugin extends Plugin {
         }
     }
 
-    private Uri getTempImage(Uri u, ByteArrayOutputStream bitmapOutputStream) {
+    private Uri getTempMedia(Uri u, ByteArrayOutputStream outputStream) {
         ByteArrayInputStream bis = null;
         Uri newUri = null;
         try {
-            bis = new ByteArrayInputStream(bitmapOutputStream.toByteArray());
+            bis = new ByteArrayInputStream(outputStream.toByteArray());
             newUri = saveImage(u, bis);
         } catch (IOException ex) {} finally {
             if (bis != null) {
@@ -767,25 +848,31 @@ public class CameraPlugin extends Plugin {
         return bitmap;
     }
 
-    private void returnDataUrl(PluginCall call, ExifWrapper exif, ByteArrayOutputStream bitmapOutputStream) {
-        byte[] byteArray = bitmapOutputStream.toByteArray();
+    private void returnDataUrl(PluginCall call, ExifWrapper exif, Uri uri, ByteArrayOutputStream outputStream, boolean isVideo) {
+        byte[] byteArray = outputStream.toByteArray();
         String encoded = Base64.encodeToString(byteArray, Base64.NO_WRAP);
+        String extension = getFileExtension(uri);
 
         JSObject data = new JSObject();
-        data.put("format", "jpeg");
-        data.put("dataUrl", "data:image/jpeg;base64," + encoded);
-        data.put("exif", exif.toJson());
+        data.put("format", extension);
+        data.put("dataUrl", "data:image/" + extension + ";base64," + encoded);
+        if (!isVideo) {
+            data.put("exif", exif.toJson());
+        }
         call.resolve(data);
     }
 
-    private void returnBase64(PluginCall call, ExifWrapper exif, ByteArrayOutputStream bitmapOutputStream) {
-        byte[] byteArray = bitmapOutputStream.toByteArray();
+    private void returnBase64(PluginCall call, ExifWrapper exif, Uri uri, ByteArrayOutputStream outputStream, boolean isVideo) {
+        byte[] byteArray = outputStream.toByteArray();
         String encoded = Base64.encodeToString(byteArray, Base64.NO_WRAP);
+        String extension = getFileExtension(uri);
 
         JSObject data = new JSObject();
-        data.put("format", "jpeg");
+        data.put("format", extension);
         data.put("base64String", encoded);
-        data.put("exif", exif.toJson());
+        if (!isVideo) {
+            data.put("exif", exif.toJson());
+        }
         call.resolve(data);
     }
 
@@ -843,9 +930,9 @@ public class CameraPlugin extends Plugin {
         return permissionStates;
     }
 
-    private void editImage(PluginCall call, Uri uri, ByteArrayOutputStream bitmapOutputStream) {
+    private void editImage(PluginCall call, Uri uri, ByteArrayOutputStream outputStream) {
         try {
-            Uri tempImage = getTempImage(uri, bitmapOutputStream);
+            Uri tempImage = getTempMedia(uri, outputStream);
             Intent editIntent = createEditIntent(tempImage);
             if (editIntent != null) {
                 startActivityForResult(call, editIntent, "processEditedImage");

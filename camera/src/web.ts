@@ -14,7 +14,11 @@ export class CameraWeb extends WebPlugin implements CameraPlugin {
   async getPhoto(options: ImageOptions): Promise<Photo> {
     // eslint-disable-next-line no-async-promise-executor
     return new Promise<Photo>(async (resolve, reject) => {
-      if (options.webUseInput || options.source === CameraSource.Photos) {
+      if (
+        options.webUseInput ||
+        options.source === CameraSource.Photos ||
+        options.source === CameraSource.Videos
+      ) {
         this.fileInputExperience(options, resolve, reject);
       } else if (options.source === CameraSource.Prompt) {
         let actionSheet: any = document.querySelector('pwa-action-sheet');
@@ -155,11 +159,16 @@ export class CameraWeb extends WebPlugin implements CameraPlugin {
       });
     }
 
-    input.accept = 'image/*';
+    if (options.source === CameraSource.Videos) {
+      input.accept = 'video/*';
+    } else {
+      input.accept = 'image/*';
+    }
     (input as any).capture = true;
 
     if (
       options.source === CameraSource.Photos ||
+      options.source === CameraSource.Videos ||
       options.source === CameraSource.Prompt
     ) {
       input.removeAttribute('capture');

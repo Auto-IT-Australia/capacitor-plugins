@@ -6,6 +6,7 @@ public enum CameraSource: String {
     case prompt = "PROMPT"
     case camera = "CAMERA"
     case photos = "PHOTOS"
+    case videos = "VIDEOS"
 }
 
 public enum CameraDirection: String {
